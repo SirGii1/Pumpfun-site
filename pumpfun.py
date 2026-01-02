@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import httpx
@@ -5,112 +6,129 @@ import websockets
 from flask import Flask
 from threading import Thread
 
-# --- CONFIGURATION ---
+# =================================================================
+# 1. CONFIGURATION
+# =================================================================
 BOT_TOKEN = "8579945497:AAG2rxeNscB9mo--d2F1l3dWvwqiUlFuEz8"
 CHAT_ID = "-1003566409395"
-HELIUS_API_KEY = "YOUR_HELIUS_API_KEY"  # Get this free at helius.dev
+
+RPC_URL = "https://api.mainnet-beta.solana.com" 
 WS_URL = "wss://pumpportal.fun/api/data"
 
-# --- KEEP-ALIVE SERVER ---
 app = Flask('')
 @app.route('/')
-def home(): return "Advanced Monitor is Online"
+def home(): return "<h1>Bot Status: 🟢 Live Feed Active</h1>"
 
 def run_web_server():
     app.run(host='0.0.0.0', port=8080)
 
-# --- ANALYSIS TOOLS ---
-async def get_dev_history(dev_address):
-    """Checks how many tokens this dev has created previously."""
-    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "dev-check",
-        "method": "getAssetsByCreator",
-        "params": {
-            "creatorAddress": dev_address,
-            "onlyVerified": False,
-            "page": 1,
-            "limit": 100
-        }
-    }
+# =================================================================
+# 2. DATA FETCHING
+# =================================================================
+async def get_wallet_stats(address):
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url, json=payload, timeout=5.0)
-            data = response.json()
-            items = data.get("result", {}).get("items", [])
-            return len(items)
-        except: return 0
+            b_p = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address]}
+            h_p = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [address, {"limit": 50}]}
+            
+            b_res, h_res = await asyncio.gather(
+                client.post(RPC_URL, json=b_p, timeout=5.0),
+                client.post(RPC_URL, json=h_p, timeout=5.0)
+            )
+            
+            sol = round(b_res.json().get("result", {}).get("value", 0) / 1_000_000_000, 2)
+            activity = len(h_res.json().get("result", []))
+            return sol, activity
+        except: return 0.0, 0
 
-async def fetch_metadata(uri):
+async def fetch_token_metadata(uri):
     async with httpx.AsyncClient() as client:
         try:
             res = await client.get(uri, timeout=5.0)
             return res.json() if res.status_code == 200 else {}
         except: return {}
 
-# --- PROCESSING ---
-async def process_token(data):
-    mint = data.get("mint")
-    trader = data.get("trader") # The dev wallet address
-    uri = data.get("uri")
+# =================================================================
+# 3. MESSAGE ENGINE (SENDS ALL TOKENS)
+# =================================================================
+async def process_event(data):
+    mint, dev, uri = data.get("mint"), data.get("trader"), data.get("uri")
+    name, symbol = data.get("name", "Unknown"), data.get("symbol", "TOKEN")
     
-    # 1. Fetch Socials
-    metadata = await fetch_metadata(uri) if uri else {}
-    telegram = metadata.get("telegram") or data.get("telegram")
+    # Fetch Metadata
+    meta = await fetch_token_metadata(uri) if uri else {}
+    tg_link = meta.get("telegram") or data.get("telegram")
+    twitter = meta.get("twitter") or data.get("twitter")
 
-    # 2. Strict TG Filter
-    if not telegram:
-        return
-
-    # 3. Dev Wallet Analysis
-    prev_tokens_count = await get_dev_history(trader)
+    # Fetch Wallet Stats
+    sol_bal, tx_count = await get_wallet_stats(dev)
     
-    # Analysis Logic
-    risk_level = "🟢 LOW" if prev_tokens_count < 3 else "⚠️ HIGH (Serial Launcher)"
-    dev_summary = f"👤 <b>Dev Wallet:</b> <code>{trader[:6]}...{trader[-4:]}</code>\n"
-    dev_summary += f"📊 <b>Previous Launches:</b> {prev_tokens_count}\n"
-    dev_summary += f"🛡️ <b>Risk:</b> {risk_level}"
-
-    # 4. Format Message
-    name = data.get("name", "Unknown")
-    symbol = data.get("symbol", "TOKEN")
-    twitter = metadata.get("twitter") or data.get("twitter")
-    website = metadata.get("website") or data.get("website")
-
-    links = [f'✈️ <a href="{telegram}">Telegram</a>']
-    if twitter: links.append(f'🐦 <a href="{twitter}">Twitter</a>')
-    if website: links.append(f'🌐 <a href="{website}">Website</a>')
+    # Determine Social Status for the message
+    social_text = ""
+    links_list = []
+    if tg_link: links_list.append(f'✈️ <a href="{tg_link}">Telegram</a>')
+    if twitter: links_list.append(f'🐦 <a href="{twitter}">Twitter</a>')
     
-    message = (
-        f"🚀 <b>NEW TOKEN WITH TELEGRAM</b>\n"
+    if links_list:
+        social_text = "  |  ".join(links_list)
+    else:
+        social_text = "❌ No Socials Found"
+
+    # Message Construction
+    text = (
+        f"🆕 <b>NEW TOKEN CREATED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>{name}</b> (${symbol})\n"
         f"📝 <code>{mint}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dev_summary}\n"
+        f"👤 <b>Dev Wallet:</b>\n"
+        f"💰 <b>Balance:</b> {sol_bal} SOL\n"
+        f"📊 <b>Activity:</b> {tx_count} Txs\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Links:</b> {' | '.join(links)}\n\n"
-        f"💊 <a href='https://pump.fun/{mint}'><b>BUY ON PUMP.FUN</b></a>"
+        f"🔗 {social_text}\n\n"
+        f"💊 <a href='https://pump.fun/{mint}'><b>TRADE ON PUMP.FUN</b></a>"
     )
 
-    # 5. Send to Telegram
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload)
+    # Trading Buttons
+    keyboard = {"inline_keyboard": [
+        [{"text": "🛡️ Buy Trojan", "url": f"https://t.me/pumptrojanbot?start=r-user-{mint}"},
+         {"text": "🐶 Buy BonkBot", "url": f"https://t.me/bonkbot?start={mint}"}],
+        [{"text": "📊 Dexscreener", "url": f"https://dexscreener.com/solana/{mint}"},
+         {"text": "🕵️ Dev Wallet", "url": f"https://solscan.io/account/{dev}"}]
+    ]}
 
+    # Send Message
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard), "disable_web_page_preview": True
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(api_url, json=payload)
+        except Exception as e:
+            print(f"Error sending to TG: {e}")
+
+# =================================================================
+# 4. RUNNER
+# =================================================================
 async def main():
-    print("🟢 Tracking Live: Socials + Dev Analysis Active...")
+    print("🚀 Sniper Live Feed Started. Sending ALL tokens...")
     async for websocket in websockets.connect(WS_URL):
         try:
             await websocket.send(json.dumps({"method": "subscribeNewToken"}))
             async for message in websocket:
-                token_data = json.loads(message)
-                if token_data.get("txType") == "create":
-                    asyncio.create_task(process_token(token_data))
-        except: continue
+                response = json.loads(message)
+                if response.get("txType") == "create":
+                    asyncio.create_task(process_event(response))
+        except Exception as e:
+            print(f"WebSocket error: {e}. Reconnecting...")
+            await asyncio.sleep(2)
+            continue
 
 if __name__ == "__main__":
     Thread(target=run_web_server).start()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
